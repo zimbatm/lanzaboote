@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fs;
 use std::os::unix::prelude::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -8,38 +9,71 @@ use nix::unistd::sync;
 use tempfile::tempdir;
 
 use crate::esp::EspPaths;
-use crate::generation::Generation;
+use crate::gc::Roots;
+use crate::generation::{Generation, GenerationLink};
 use crate::pe;
 use crate::signature::KeyPair;
 
 pub struct Installer {
+    gc_roots: RefCell<Roots>,
     lanzaboote_stub: PathBuf,
     key_pair: KeyPair,
+    configuration_limit: u64,
     esp: PathBuf,
-    generations: Vec<PathBuf>,
+    generation_links: Vec<PathBuf>,
 }
 
 impl Installer {
     pub fn new(
         lanzaboote_stub: PathBuf,
         key_pair: KeyPair,
+        configuration_limit: u64,
         esp: PathBuf,
-        generations: Vec<PathBuf>,
+        generation_links: Vec<PathBuf>,
     ) -> Self {
         Self {
+            gc_roots: RefCell::new(Roots::new()),
             lanzaboote_stub,
             key_pair,
+            configuration_limit,
             esp,
-            generations,
+            generation_links,
         }
     }
 
     pub fn install(&self) -> Result<()> {
-        for toplevel in &self.generations {
-            let generation_result = Generation::from_toplevel(toplevel).with_context(|| {
-                format!("Failed to build generation from toplevel: {toplevel:?}")
-            });
+        let mut links = self
+            .generation_links
+            .iter()
+            .map(GenerationLink::from_path)
+            .collect::<Result<Vec<GenerationLink>>>()?;
 
+        // A configuration limit of 0 means there is no limit
+        if self.configuration_limit > 0 {
+            // Sort the links by version
+            links.sort();
+
+            // Only install the number of generations configured
+            links = links
+                .into_iter()
+                .rev()
+                .take(self.configuration_limit as usize)
+                .collect()
+        };
+        self.install_links(links)?;
+
+        self.gc_roots.borrow().collect_garbage(&self.esp)?;
+
+        Ok(())
+    }
+
+    fn install_links(&self, links: Vec<GenerationLink>) -> Result<()> {
+        for link in links {
+            let generation_result = Generation::from_link(&link)
+                .with_context(|| format!("Failed to build generation from link: {link:?}"));
+
+            // Ignore failing to read a generation so that old malformed generations do not stop
+            // lanzaboote from working
             let generation = match generation_result {
                 Ok(generation) => generation,
                 Err(e) => {
@@ -47,7 +81,7 @@ impl Installer {
                     continue;
                 }
             };
-            
+
             println!("Installing generation {generation}");
 
             self.install_generation(&generation)
@@ -62,7 +96,6 @@ impl Installer {
                     .context("Failed to install specialisation")?;
             }
         }
-
         Ok(())
     }
 
@@ -71,6 +104,7 @@ impl Installer {
         let secureboot_extensions = &generation.spec.extensions;
 
         let esp_paths = EspPaths::new(&self.esp, generation)?;
+        self.gc_roots.borrow_mut().extend(esp_paths.to_iter());
 
         let kernel_cmdline =
             assemble_kernel_cmdline(&bootspec.init, bootspec.kernel_params.clone());
