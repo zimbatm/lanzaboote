@@ -6,30 +6,45 @@
 let
   inherit (pkgs) lib;
 
-  mkSecureBootTest = { name, machine ? { }, testScript }: testPkgs.nixosTest {
-    inherit name testScript;
-    nodes.machine = { lib, ... }: {
-      imports = [
-        lanzabooteModule
-        machine
-      ];
+  commonModule = { lib, ... }: {
+    imports = [
+      lanzabooteModule
+    ];
 
-      virtualisation = {
-        useBootLoader = true;
-        useEFIBoot = true;
-        useSecureBoot = true;
-      };
+    virtualisation = {
+      useBootLoader = true;
+      useEFIBoot = true;
+      useSecureBoot = true;
+    };
 
-      boot.loader.efi = {
-        canTouchEfiVariables = true;
-      };
-      boot.lanzaboote = {
-        enable = true;
-        enrollKeys = lib.mkDefault true;
-        pkiBundle = ../../pki;
-      };
+    boot.loader.efi = {
+      canTouchEfiVariables = true;
+    };
+    boot.lanzaboote = {
+      enable = true;
+      enrollKeys = lib.mkDefault true;
+      pkiBundle = ../../pki;
     };
   };
+
+  mkSecureBootTest =
+    { name
+    , nodes ? { }
+    , machine ? { }
+    , testScript
+    , broken ? false
+    }: testPkgs.nixosTest {
+      inherit name testScript;
+      meta = { inherit broken; };
+      nodes = {
+        machine = _: {
+          imports = [
+            commonModule
+            machine
+          ];
+        };
+      } // nodes;
+    };
 
   # Execute a boot test that is intended to fail.
   #
@@ -146,11 +161,56 @@ in
       machine.succeed("bootctl set-default nixos-generation-1-specialisation-variant.efi")
       machine.succeed("sync")
       machine.fail("efibootmgr")
-      machine.crash()
+      machin.crash()
       machine.start()
       print(machine.succeed("bootctl"))
       # We have efibootmgr in this specialisation.
       machine.succeed("efibootmgr")
     '';
+  };
+
+  # This test is supposed to produce more generations than specified in the
+  # configurationLimit and assert that when the limit is reached only the
+  # correct numbers of generations remain on the ESP. This test mostly serves
+  # as a stub for someone else to figure it out. Additionally, there are no
+  # tests in nixpkgs that verify that the configurationLimit garbage collection
+  # works.
+  _config-limit = mkSecureBootTest {
+    name = "lanzaboote-respects-config-limit";
+    # Currently this test is broken because you cannot easily run nixos-rebuild
+    # with an out-of-tree module in a VM test. Just calling
+    # switch-to-configuration does not produce the links in
+    # /nix/var/nix/profiles which are needed for lanzatool to install
+    # generations. Only nixos-rebuild produces the right paths.
+    broken = true;
+
+    nodes = {
+      gen0 = _: {
+        imports = [ commonModule ];
+        boot.lanzaboote.configurationLimit = 2;
+        boot.lanzaboote.enrollKeys = false;
+      };
+      gen1 = _: {
+        imports = [ commonModule ];
+        networking.hostName = "wowMuchChange";
+        boot.lanzaboote.configurationLimit = 2;
+        boot.lanzaboote.enrollKeys = false;
+      };
+    };
+
+    testScript = { nodes, ... }:
+      let
+        system0 = nodes.gen0.config.system.build.toplevel;
+        system1 = nodes.gen1.config.system.build.toplevel;
+      in
+      ''
+        machine.start()
+
+        print(machine.succeed("nix-env -p /nix/var/nix/profiles/system --set ${system0}"))
+        print(machine.succeed("${system0}/bin/switch-to-configuration boot"))
+
+        print(machine.succeed("nix-env -p /nix/var/nix/profiles/system --set ${system1}"))
+        print(machine.succeed("${system1}/bin/switch-to-configuration boot"))
+      '';
   };
 }
